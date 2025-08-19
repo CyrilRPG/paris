@@ -28,7 +28,6 @@ def http_get(path: str, headers: Dict[str, str], params: Dict[str, Any] = None) 
     data = r.json()
     if not isinstance(data, dict):
         raise RuntimeError(f"Réponse inattendue sur {path}: type={type(data)}")
-    # uniformise la présence des clés
     data.setdefault("errors", {})
     data.setdefault("response", [])
     return data
@@ -43,7 +42,7 @@ def _normalize_profiles_list(resp: List[Any]) -> List[Dict[str, Any]]:
     out = []
     for x in resp:
         if isinstance(x, dict):
-            if "id" in x:  # déjà au bon format
+            if "id" in x:
                 out.append(x)
             elif "player" in x and isinstance(x["player"], dict) and "id" in x["player"]:
                 merged = dict(x["player"])
@@ -54,11 +53,11 @@ def _normalize_profiles_list(resp: List[Any]) -> List[Dict[str, Any]]:
 
 def _build_search_terms(player_query: str) -> List[str]:
     q = norm(player_query)
-    toks = [t for t in q.split() if len(t) >= 3]
-    if not toks and len(q) >= 3:
-        toks = [q[:3]]
-    terms = list(dict.fromkeys(toks + ([q] if len(q) >= 3 else [])))
-    return terms[:5]
+    toks = [t for t in q.split() if len(t) >= 2]  # >=2 pour tolérance
+    if not toks and len(q) >= 2:
+        toks = [q[:2]]
+    terms = list(dict.fromkeys(toks + ([q] if len(q) >= 2 else [])))
+    return terms[:6]
 
 def profiles_search_smart(headers: Dict[str, str], player_query: str) -> List[Dict[str, Any]]:
     terms = _build_search_terms(player_query)
@@ -70,19 +69,38 @@ def profiles_search_smart(headers: Dict[str, str], player_query: str) -> List[Di
         for p in prof:
             pid = p.get("id")
             if isinstance(pid, int) and pid not in seen:
-                seen.add(pid)
-                bag.append(p)
-        time.sleep(0.1)  # limiter RPS
-    # score par correspondance sur tokens
+                seen.add(pid); bag.append(p)
+        time.sleep(0.08)
+    # scoring simple sur tokens
     qtokens = [t for t in norm(player_query).split() if t]
     scored = []
     for p in bag:
         cand = p.get("name") or f"{p.get('firstname','')} {p.get('lastname','')}".strip()
         cn = norm(cand)
-        score = sum(tok in cn for tok in qtokens)
+        score = sum(tok in cn for tok in qtokens) + (2 if norm(player_query) == cn else 0)
         scored.append((score, p))
     scored.sort(key=lambda x: (-x[0], norm(x[1].get("name") or "")))
     return [p for _, p in scored][:50]
+
+def profiles_bruteforce(headers: Dict[str, str], player_query: str, pages: int = 3) -> List[Dict[str, Any]]:
+    """Balaye /players/profiles pages 1..pages et filtre côté client."""
+    needle = norm(player_query)
+    bag: List[Dict[str, Any]] = []
+    for page in range(1, max(1, pages) + 1):
+        data = http_get("players/profiles", headers, params={"page": page})
+        for p in _normalize_profiles_list(data["response"]):
+            name = p.get("name") or f"{p.get('firstname','')} {p.get('lastname','')}".strip()
+            if needle and needle in norm(name):
+                bag.append(p)
+        time.sleep(0.08)
+    # dédoublonne
+    seen: Set[int] = set()
+    uniq = []
+    for p in bag:
+        pid = p.get("id")
+        if isinstance(pid, int) and pid not in seen:
+            seen.add(pid); uniq.append(p)
+    return uniq[:50]
 
 # =========================
 # --- Recherche équipes
@@ -96,14 +114,11 @@ def search_teams(headers: Dict[str, str], q: str) -> List[Dict[str, Any]]:
         if not isinstance(r, dict):
             continue
         team = r.get("team") or {}
-        country = r.get("country") or r.get("country")  # parfois string direct
         if isinstance(team, dict):
             out.append({
                 "id": team.get("id"),
                 "name": team.get("name"),
-                "code": team.get("code"),
-                "national": team.get("national"),  # True pour sélections
-                "country": country if isinstance(country, str) else None,
+                "national": team.get("national"),
             })
     # dédupe
     seen: Set[int] = set()
@@ -114,63 +129,14 @@ def search_teams(headers: Dict[str, str], q: str) -> List[Dict[str, Any]]:
             seen.add(tid); uniq.append(t)
     return uniq
 
-# =========================
-# --- Fallback: équipes du joueur sans /players/teams
-# =========================
-def get_player_seasons(headers: Dict[str, str], player_id: int) -> List[int]:
-    data = http_get("players/seasons", headers, params={"player": player_id})
-    seasons = data.get("response", []) or []
-    return [int(s) for s in seasons if isinstance(s, int)]
-
-def teams_from_players_stats(headers: Dict[str, str], player_id: int, seasons: List[int], limit: int = 5) -> List[Dict[str, Any]]:
-    teams: List[Dict[str, Any]] = []
-    seen: Set[int] = set()
-    for y in sorted(seasons, reverse=True)[:max(1, limit)]:
-        data = http_get("players", headers, params={"id": player_id, "season": y})
-        for rec in data["response"]:
-            for st in rec.get("statistics", []) or []:
-                team = st.get("team") or {}
-                tid, tname = team.get("id"), team.get("name")
-                if isinstance(tid, int) and tid not in seen:
-                    seen.add(tid)
-                    teams.append({"id": tid, "name": tname, "national": False})
-        time.sleep(0.1)
-    return teams
-
-def build_team_candidates(headers: Dict[str, str], player_profile: Dict[str, Any], team_hint: str) -> List[Dict[str, Any]]:
-    """
-    Construit une liste d'équipes candidates si /players/teams est vide :
-    - hint utilisateur via /teams?search=
-    - équipe nationale via nationality (sélection)
-    - clubs récents via /players?id=&season=
-    """
-    candidates: List[Dict[str, Any]] = []
-    seen: Set[int] = set()
-
-    # 1) hint utilisateur
-    for t in search_teams(headers, team_hint):
-        if isinstance(t.get("id"), int) and t["id"] not in seen:
-            seen.add(t["id"]); candidates.append(t)
-
-    # 2) équipe nationale depuis nationality
-    nat = (player_profile.get("nationality") or "").strip()
-    if nat:
-        for t in search_teams(headers, nat):
-            # on retient seulement les sélections nationales
-            if t.get("national") and isinstance(t.get("id"), int) and t["id"] not in seen:
-                seen.add(t["id"]); candidates.append(t)
-
-    # 3) clubs récents via players/seasons -> players?id&season
-    pid = player_profile.get("id")
-    if isinstance(pid, int):
-        seasons = get_player_seasons(headers, pid)
-        for t in teams_from_players_stats(headers, pid, seasons, limit=5):
-            if isinstance(t.get("id"), int) and t["id"] not in seen:
-                seen.add(t["id"]); candidates.append(t)
-
-    # Tri: sélections d'abord, puis alpha
-    candidates_sorted = sorted(candidates, key=lambda t: (0 if t.get("national") else 1, norm(t.get("name") or "")))
-    return candidates_sorted
+def list_squad(headers: Dict[str, str], team_id: int) -> List[Dict[str, Any]]:
+    data = http_get("players/squads", headers, params={"team": team_id})
+    out = []
+    for blk in data["response"]:
+        for p in (blk.get("players") or []):
+            if isinstance(p, dict) and isinstance(p.get("id"), int):
+                out.append({"id": p["id"], "name": p.get("name"), "position": p.get("position")})
+    return out
 
 # =========================
 # --- Fixtures & extraction
@@ -292,11 +258,12 @@ with st.sidebar:
     st.header("🔧 Paramètres")
     provider = st.selectbox("Fournisseur", ["API-SPORTS", "RapidAPI"], index=0)
     secret_key = st.secrets.get("API_KEY") if hasattr(st, "secrets") else None
-    api_key = st.text_input("API Key", value=secret_key or "", type="password",
-                            help="Astuce : ajoute API_KEY dans Settings > Secrets sur Streamlit Cloud.")
-    player_query = st.text_input("🔎 Joueur (ex: Kylian Mbappé)", value="")
-    team_hint = st.text_input("Rechercher une équipe (optionnel)", value="", help="A pour la sélection, U21/U23/Féminines possibles.")
-    months_back = st.slider("Fenêtre glissante si nécessaire (mois)", 6, 60, 36)
+    # 👉 tu peux pré-remplir ici ta clé si tu veux :
+    api_key = st.text_input("API Key", value=secret_key or "", type="password")
+    player_query = st.text_input("🔎 Joueur (ex: Barnabas Varga / Kylian Mbappe)", value="")
+    player_id_override = st.text_input("ID joueur (optionnel, si tu le connais)", value="")
+    team_hint = st.text_input("Indice équipe (optionnel, ex: France ou Real Madrid)", value="")
+    months_back = st.slider("Fenêtre glissante (mois)", 6, 60, 36)
     run_btn = st.button("▶️ Rechercher & extraire")
 
 def export_csv(df: pd.DataFrame, filename: str):
@@ -307,8 +274,6 @@ if run_btn:
     try:
         if not api_key.strip():
             st.error("Merci de renseigner la clé API."); st.stop()
-        if not player_query.strip():
-            st.error("Merci de saisir un nom de joueur."); st.stop()
 
         headers = api_headers(provider, api_key.strip())
 
@@ -320,33 +285,92 @@ if run_btn:
         except Exception:
             st.info("Info: /status indisponible (non bloquant).")
 
-        # --- 1) Trouver le joueur (et garder nationality pour fallback)
-        profs = profiles_search_smart(headers, player_query)
-        if not profs:
-            raise RuntimeError("Aucun profil joueur trouvé. Vérifie l’orthographe.")
-        options = []
-        profile_map = {}
-        for p in profs[:50]:
-            pid = p.get("id")
-            nm = p.get("name") or f"{p.get('firstname','')} {p.get('lastname','')}".strip()
-            nat = p.get("nationality") or "?"
-            by  = (p.get("birth") or {}).get("date") if isinstance(p.get("birth"), dict) else "?"
-            label = f"{nm} — {nat} — id:{pid}"
-            options.append((label, pid))
-            profile_map[pid] = p
+        # --- 1) Déterminer le joueur (ID direct > recherche normale > bruteforce > effectif équipe)
+        chosen_player: Optional[Dict[str, Any]] = None
 
-        label = st.selectbox("Sélectionne le joueur", [o[0] for o in options])
-        player_id = int(dict(options)[label])
-        player_profile = profile_map[player_id]
-        st.write(f"**Joueur choisi** → id : `{player_id}`")
+        # a) ID override
+        if player_id_override.strip().isdigit():
+            pid = int(player_id_override.strip())
+            # on récupère son profil pour afficher son nom
+            prof = http_get("players/profiles", headers, params={"player": pid})
+            resp = _normalize_profiles_list(prof["response"])
+            if resp:
+                chosen_player = resp[0]
+            else:
+                # pas de profil retourné: on crée une coquille minimaliste
+                chosen_player = {"id": pid, "name": f"Player {pid}"}
 
-        # --- 2) Essayer /players/teams avec player=ID
+        # b) recherche classique
+        if not chosen_player:
+            if not player_query.strip():
+                st.error("Merci de saisir un nom de joueur ou un ID joueur."); st.stop()
+            profs = profiles_search_smart(headers, player_query)
+            if profs:
+                # sélection si plusieurs
+                opts = []
+                for p in profs:
+                    pid = p.get("id")
+                    nm = p.get("name") or f"{p.get('firstname','')} {p.get('lastname','')}".strip()
+                    nat = p.get("nationality") or "?"
+                    by  = (p.get("birth") or {}).get("date") if isinstance(p.get("birth"), dict) else "?"
+                    opts.append((f"{nm} — {nat} — id:{pid}", pid, p))
+                label = st.selectbox("Sélectionne le joueur", [o[0] for o in opts])
+                chosen_player = next(p for (lab, pid, p) in opts if lab == label)
+
+        # c) bruteforce global sur /players/profiles (pages 1..3)
+        if not chosen_player:
+            st.info("Recherche étendue (bruteforce) sur /players/profiles pages 1..3…")
+            profs = profiles_bruteforce(headers, player_query, pages=3)
+            if profs:
+                opts = []
+                for p in profs:
+                    pid = p.get("id")
+                    nm = p.get("name") or f"{p.get('firstname','')} {p.get('lastname','')}".strip()
+                    nat = p.get("nationality") or "?"
+                    opts.append((f"{nm} — {nat} — id:{pid}", pid, p))
+                label = st.selectbox("Sélectionne le joueur (bruteforce)", [o[0] for o in opts])
+                chosen_player = next(p for (lab, pid, p) in opts if lab == label)
+
+        # d) fallback effectif équipe (si team_hint fourni)
+        if not chosen_player and team_hint.strip():
+            teams = search_teams(headers, team_hint)
+            if not teams:
+                st.error("Aucune équipe trouvée avec cet indice. Réessaie un autre libellé."); st.stop()
+            if len(teams) > 1:
+                labels = [f"{t['name']} — id:{t['id']} — {'Sélection' if t.get('national') else 'Club'}" for t in teams]
+                tlabel = st.selectbox("Plusieurs équipes trouvées, choisis :", labels)
+                team_id = int(tlabel.split("id:")[1].split(" ")[0])
+            else:
+                team_id = teams[0]["id"]
+
+            squad = list_squad(headers, team_id)
+            if not squad:
+                st.error("Effectif introuvable pour cette équipe."); st.stop()
+
+            # filtre best-effort sur la saisie
+            needle = norm(player_query)
+            matches = [p for p in squad if needle in norm(p.get("name") or "")]
+            pool = matches if matches else squad
+            slog = " (filtré)" if matches else " (effectif complet)"
+            plabels = [f"{p['name']} — id:{p['id']}" for p in pool]
+            sel = st.selectbox(f"Sélectionne le joueur{slog}", plabels)
+            pid = int(sel.split("id:")[1])
+            # récup profil léger
+            prof = http_get("players/profiles", headers, params={"player": pid})
+            resp = _normalize_profiles_list(prof["response"])
+            chosen_player = resp[0] if resp else {"id": pid, "name": sel.split(" — id:")[0]}
+
+        if not chosen_player:
+            raise RuntimeError("Aucun profil joueur trouvé après toutes les stratégies. Ajoute un indice d’équipe ou l’ID joueur.")
+
+        player_id = int(chosen_player.get("id"))
+        player_name = chosen_player.get("name") or f"{chosen_player.get('firstname','')} {chosen_player.get('lastname','')}".strip()
+        st.write(f"**Joueur choisi** → {player_name} (id: `{player_id}`)")
+
+        # --- 2) Équipes du joueur : préférer /players/teams mais on a aussi fallback plus loin
         team_candidates: List[Dict[str, Any]] = []
         try:
             pteams = http_get("players/teams", headers, params={"player": player_id})
-            # diagnostic en cas d'erreur
-            if pteams.get("errors") and pteams["errors"] != {}:
-                st.info(f"/players/teams a renvoyé des erreurs: {pteams['errors']}")
             for r in pteams.get("response", []) or []:
                 team = r.get("team") or {}
                 if isinstance(team, dict) and isinstance(team.get("id"), int):
@@ -355,30 +379,26 @@ if run_btn:
                         "name": team.get("name"),
                         "national": team.get("national"),
                     })
-        except Exception as e:
-            st.info(f"/players/teams indisponible ({e}). Fallback activé.")
+        except Exception:
+            pass
 
-        # --- 3) Fallback si vide : nationalité + clubs récents + hint
+        # Ajoute l’indice équipe saisi par l’utilisateur si utile
+        if team_hint.strip():
+            for t in search_teams(headers, team_hint):
+                if isinstance(t.get("id"), int) and t not in team_candidates:
+                    team_candidates.append(t)
+
         if not team_candidates:
-            st.warning("Impossible de récupérer les équipes via /players/teams → on active le fallback (nationalité, clubs récents, recherche).")
-            team_candidates = build_team_candidates(headers, player_profile, team_hint)
+            st.warning("Aucune équipe remontée par /players/teams. Entre un indice d’équipe dans la barre latérale (club ou sélection).")
+            st.stop()
 
-        if not team_candidates:
-            raise RuntimeError("Aucune équipe candidate trouvée (même en fallback). Ajoute un indice dans 'Rechercher une équipe'.")
-
-        # Tri: sélections en premier
+        # tri: Sélection d’abord
         team_candidates = sorted(team_candidates, key=lambda t: (0 if t.get("national") else 1, norm(t.get("name") or "")))
+        tlabels = [f"{t['name']} — id:{t['id']} — {'Sélection' if t.get('national') else 'Club'}" for t in team_candidates]
+        tchoice = st.selectbox("Choisis l’équipe (ex: France)", tlabels)
+        team_id = int(tchoice.split("id:")[1].split(" ")[0])
 
-        labels = [f"{t['name']} — id:{t['id']} — {'Sélection' if t.get('national') else 'Club'}" for t in team_candidates]
-        choice = st.selectbox("Choisis l’équipe (ex: France)", labels)
-        team_id = int(choice.split("id:")[1].split(" ")[0])
-        is_national = ("Sélection" in choice)
-        st.write(f"**Équipe choisie** → id : `{team_id}` — {'Sélection' if is_national else 'Club'}")
-
-        # --- 4) Fixtures : derniers matchs puis fenêtre glissante
-        fixtures: List[Dict[str, Any]] = []
-        used_note = ""
-
+        # --- 3) Fixtures (last50, puis fenêtre glissante)
         fixtures = fixtures_by_team_last(headers, team_id, n=50)
         used_note = "last50"
         if len(fixtures) == 0:
@@ -388,13 +408,13 @@ if run_btn:
             used_note = f"range_{from_date.isoformat()}_to_{to_date.isoformat()}"
 
         if len(fixtures) == 0:
-            st.error("Aucune fixture trouvée après les fallbacks. Essaie d’augmenter la fenêtre (mois) ou sélectionne un club.")
+            st.error("Aucune fixture trouvée. Essaie une autre équipe ou augmente la fenêtre (mois).")
             st.stop()
 
         st.write(f"{len(fixtures)} fixtures trouvées. Source: {used_note}")
         prog = st.progress(0.0)
 
-        # --- 5) Extraction par match
+        # --- 4) Extraction
         rows = []
         top_assists_cache: Dict[Tuple[int, Optional[int]], List[int]] = {}
         total = max(1, len(fixtures))
@@ -427,13 +447,9 @@ if run_btn:
 
             fps = get_fixture_players(headers, fixture_id)
             minutes, goals = extract_player_minutes_goals(fps, player_id)
-            scored = goals > 0
-
             evs = get_fixture_events(headers, fixture_id)
             took_pen = player_took_penalty(evs, player_id)
-
             lineups = get_fixture_lineups(headers, fixture_id)
-
             odds = get_fixture_odds(headers, fixture_id)
             opp_price = extract_opponent_price(odds, opponent_side)
 
@@ -452,7 +468,7 @@ if run_btn:
                 "adversaire": opponent_name,
                 "dom_ext": dom_ext,
                 "minutes": minutes,
-                "but": int(scored),
+                "but": int(goals > 0),
                 "tire_pen": int(took_pen),
                 "cote_adversaire_1x2": opp_price,
                 "passeur_principal_present": key_assister_present,
@@ -462,14 +478,14 @@ if run_btn:
                 "round": round_str,
             })
 
-            time.sleep(0.08)
+            time.sleep(0.06)
             prog.progress(min(1.0, idx/total))
 
         df = pd.DataFrame(rows)
         st.subheader("Résultats")
+
         if df.empty:
-            st.warning("Aucune ligne à afficher (DF vide).")
-            st.stop()
+            st.warning("Aucune ligne à afficher (DF vide)."); st.stop()
 
         if "date" in df.columns:
             df = df.sort_values(["date", "fixture_id"] if "fixture_id" in df.columns else ["date"])
