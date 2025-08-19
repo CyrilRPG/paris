@@ -1,5 +1,6 @@
 import time
 import unicodedata
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
@@ -35,16 +36,30 @@ def yesno(b: bool) -> int:
 # =========================
 # --- Recherche équipe / joueur
 # =========================
-def search_team_id(headers: Dict[str, str], team_query: str) -> Optional[int]:
-    if not team_query.strip():
-        return None
-    data = http_get("teams", headers, params={"search": team_query})
+def search_teams(headers: Dict[str, str], q: str) -> List[Dict[str, Any]]:
+    data = http_get("teams", headers, params={"search": q})
+    out = []
     for r in data.get("response", []) or []:
-        if isinstance(r, dict):
-            tid = (r.get("team") or {}).get("id")
-            if isinstance(tid, int):
-                return tid
-    return None
+        if not isinstance(r, dict):
+            continue
+        team = r.get("team") or {}
+        country = r.get("country") or {}
+        if isinstance(team, dict):
+            out.append({
+                "id": team.get("id"),
+                "name": team.get("name"),
+                "code": team.get("code"),
+                "country": country if isinstance(country, str) else r.get("country"),
+                "national": team.get("national"),  # True pour sélections
+            })
+    # dédupe, garde ordonné
+    seen = set()
+    uniq = []
+    for t in out:
+        tid = t.get("id")
+        if isinstance(tid, int) and tid not in seen:
+            seen.add(tid); uniq.append(t)
+    return uniq
 
 def list_squad_candidates(headers: Dict[str, str], team_id: int, player_query: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -91,7 +106,6 @@ def _build_search_terms(player_query: str) -> List[str]:
     return terms[:5]
 
 def profiles_search_smart(headers: Dict[str, str], player_query: str) -> List[Dict[str, Any]]:
-    """Essaie plusieurs requêtes /players/profiles?search=TERM et fusionne/déduplique."""
     terms = _build_search_terms(player_query)
     seen: set = set()
     bag: List[Dict[str, Any]] = []
@@ -102,7 +116,7 @@ def profiles_search_smart(headers: Dict[str, str], player_query: str) -> List[Di
             pid = p.get("id")
             if isinstance(pid, int) and pid not in seen:
                 seen.add(pid); bag.append(p)
-        time.sleep(0.1)  # limiter le RPS
+        time.sleep(0.1)
     qtokens = [t for t in norm(player_query).split() if t]
     scored = []
     for p in bag:
@@ -114,100 +128,18 @@ def profiles_search_smart(headers: Dict[str, str], player_query: str) -> List[Di
     return [p for _, p in scored][:50]
 
 # =========================
-# --- Saison & équipe (robuste, avec fallbacks)
+# --- Fixtures (robustes, multi-stratégies)
 # =========================
-def get_player_seasons(headers: Dict[str, str], player_id: int) -> List[int]:
-    data = http_get("players/seasons", headers, params={"player": player_id})
-    seasons = data.get("response", []) or []
-    return [int(s) for s in seasons if isinstance(s, int)]
-
-def player_team_from_players_endpoint(headers: Dict[str, str], player_id: int, season: int) -> Tuple[int, Dict[str, Any]]:
-    """Utilise /players?id=PID&season=YYYY pour déterminer l'équipe.
-       Retourne (team_id, bloc_stats_choisi) — on prend l'entrée avec + de minutes."""
-    data = http_get("players", headers, params={"id": player_id, "season": season})
-    resp = data.get("response", []) or []
-    if not resp:
-        raise RuntimeError("Aucune statistique trouvée pour ce joueur et cette saison.")
-    stats_blocks = []
-    for rec in resp:
-        if not isinstance(rec, dict):
-            continue
-        for st in rec.get("statistics", []) or []:
-            if isinstance(st, dict):
-                team = st.get("team") or {}
-                tid = team.get("id")
-                if isinstance(tid, int):
-                    games = st.get("games") or {}
-                    minutes = int(games.get("minutes", 0) or 0) if isinstance(games, dict) else 0
-                    stats_blocks.append((minutes, tid, st))
-    if not stats_blocks:
-        raise RuntimeError("Impossible d’extraire l’équipe depuis /players.")
-    stats_blocks.sort(key=lambda t: -t[0])  # plus de minutes d'abord
-    return stats_blocks[0][1], stats_blocks[0][2]
-
-def get_team_seasons(headers: Dict[str, str], team_id: int) -> List[int]:
-    data = http_get("teams/seasons", headers, params={"team": team_id})
-    resp = data.get("response", []) or []
-    return [int(x) for x in resp if isinstance(x, int)]
-
-def safe_player_team_for_season(headers: Dict[str, str], player_id: int, season: int) -> Optional[Tuple[int, Dict[str, Any]]]:
-    try:
-        return player_team_from_players_endpoint(headers, player_id, season)
-    except Exception:
-        return None
-
-def resolve_team_and_season(headers: Dict[str, str],
-                            player_id: int,
-                            override_season: Optional[int],
-                            team_hint: str) -> Tuple[int, int, str]:
-    """
-    Renvoie (team_id, season, note_fallback).
-    1) saison saisie → /players?id&season ; sinon
-    2) saisons du joueur (desc) → /players?id&season ;
-    3) sinon si team_hint : team_hint + (saison saisie ou max(team/seasons) ou année courante).
-    """
-    # 1) Saison fixée par l'utilisateur
-    if override_season:
-        res = safe_player_team_for_season(headers, player_id, int(override_season))
-        if res:
-            tid, _ = res
-            return tid, int(override_season), "season_override_players_ok"
-        if team_hint.strip():
-            tid = search_team_id(headers, team_hint)
-            if tid:
-                return tid, int(override_season), "season_override_team_hint_fallback"
-
-    # 2) Parcourir les saisons du joueur
-    seasons = get_player_seasons(headers, player_id)
-    for y in sorted(seasons, reverse=True):
-        res = safe_player_team_for_season(headers, player_id, y)
-        if res:
-            tid, _ = res
-            return tid, y, "picked_best_player_season"
-
-    # 3) Fallback équipe
-    if team_hint.strip():
-        tid = search_team_id(headers, team_hint)
-        if tid:
-            if override_season:
-                return tid, int(override_season), "team_hint_with_override"
-            t_seasons = get_team_seasons(headers, tid)
-            if t_seasons:
-                return tid, max(t_seasons), "team_hint_latest_team_season"
-            from datetime import datetime
-            return tid, datetime.utcnow().year, "team_hint_default_year"
-
-    raise RuntimeError("Impossible de déterminer équipe/saison : aucune stat via /players et pas d’équipe fiable en fallback.")
-
-# =========================
-# --- Données par fixture
-# =========================
-def get_team_fixtures(headers: Dict[str, str], team_id: int, season: int) -> List[Dict[str, Any]]:
+def fixtures_by_team_season(headers: Dict[str, str], team_id: int, season: int) -> List[Dict[str, Any]]:
     data = http_get("fixtures", headers, params={"team": team_id, "season": season})
     return [fx for fx in (data.get("response", []) or []) if isinstance(fx, dict)]
 
-def get_team_fixtures_last(headers: Dict[str, str], team_id: int, n: int = 50) -> List[Dict[str, Any]]:
+def fixtures_by_team_last(headers: Dict[str, str], team_id: int, n: int = 50) -> List[Dict[str, Any]]:
     data = http_get("fixtures", headers, params={"team": team_id, "last": min(max(n,1), 50)})
+    return [fx for fx in (data.get("response", []) or []) if isinstance(fx, dict)]
+
+def fixtures_by_team_range(headers: Dict[str, str], team_id: int, date_from: str, date_to: str) -> List[Dict[str, Any]]:
+    data = http_get("fixtures", headers, params={"team": team_id, "from": date_from, "to": date_to})
     return [fx for fx in (data.get("response", []) or []) if isinstance(fx, dict)]
 
 def get_fixture_players(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
@@ -278,7 +210,21 @@ def extract_opponent_price(odds_payload: List[Dict[str, Any]], opponent_side: st
                                 pass
     return None
 
-def get_top_assisters_ids(headers: Dict[str, str], league_id: int, season: int) -> List[int]:
+def any_of_players_in_lineups(lineups: List[Dict[str, Any]], player_ids: List[int]) -> bool:
+    present = set()
+    for team in lineups:
+        for blk in ("startXI", "substitutes"):
+            for p in (team.get(blk) or []):
+                if not isinstance(p, dict):
+                    continue
+                pid = (p.get("player") or {}).get("id")
+                if isinstance(pid, int):
+                    present.add(pid)
+    return len(set(player_ids) & present) > 0
+
+def get_top_assisters_ids(headers: Dict[str, str], league_id: int, season: Optional[int]) -> List[int]:
+    if not isinstance(league_id, int) or season is None:
+        return []
     try:
         data = http_get("players/topassists", headers, params={"league": league_id, "season": season})
         ids: List[int] = []
@@ -291,18 +237,6 @@ def get_top_assisters_ids(headers: Dict[str, str], league_id: int, season: int) 
         return ids
     except Exception:
         return []
-
-def any_of_players_in_lineups(lineups: List[Dict[str, Any]], player_ids: List[int]) -> bool:
-    present = set()
-    for team in lineups:
-        for blk in ("startXI", "substitutes"):
-            for p in (team.get(blk) or []):
-                if not isinstance(p, dict):
-                    continue
-                pid = (p.get("player") or {}).get("id")
-                if isinstance(pid, int):
-                    present.add(pid)
-    return len(set(player_ids) & present) > 0
 
 def is_important_round(round_str: str) -> bool:
     s = (round_str or "").lower()
@@ -321,9 +255,10 @@ with st.sidebar:
     secret_key = st.secrets.get("API_KEY") if hasattr(st, "secrets") else None
     api_key = st.text_input("API Key", value=secret_key or "", type="password",
                             help="Astuce : ajoute API_KEY dans Settings > Secrets sur Streamlit Cloud.")
-    season_in = st.text_input("Saison (YYYY) — optionnel", value="")
-    team_hint = st.text_input("Équipe (optionnel)", value="", help="Aide à désambiguïser (ex: Ferencváros).")
-    player_query = st.text_input("🔎 Joueur (ex: Barnabás Varga)", value="")
+    player_query = st.text_input("🔎 Joueur (ex: Kylian Mbappé)", value="")
+    team_hint = st.text_input("Équipe (ex: France ou Real Madrid)", value="")
+    season_in = st.text_input("Saison (YYYY, optionnel)", value="")
+    months_back = st.slider("Fallback fenêtre (mois) si aucune saison ne marche", 6, 48, 36)
     run_btn = st.button("▶️ Rechercher & extraire")
 
 def export_csv(df: pd.DataFrame, filename: str):
@@ -347,29 +282,43 @@ if run_btn:
         except Exception:
             st.info("Info: /status indisponible (non bloquant).")
 
-        # 1) Trouver le joueur
+        # --- 1) Trouver le joueur
         chosen_player_id: Optional[int] = None
+        # On essaie d'abord via l'équipe si fournie
+        chosen_team_id: Optional[int] = None
 
-        # a) si équipe fournie → effectif
+        # Choix de l'équipe si hint fourni (on laisse sélectionner)
         if team_hint.strip():
-            tid = search_team_id(headers, team_hint)
-            if tid:
-                cands = list_squad_candidates(headers, tid, player_query)
-                if len(cands) == 1:
-                    chosen_player_id = cands[0]["id"]
-                elif len(cands) > 1:
-                    st.subheader("Plusieurs joueurs trouvés dans l’effectif :")
-                    label_map = {f"{c['name']} — {c.get('position','?')} — id:{c['id']}": c["id"] for c in cands}
-                    choice = st.selectbox("Sélectionne le joueur exact", list(label_map.keys()))
-                    chosen_player_id = int(label_map[choice])
-                else:
-                    st.warning("Aucun joueur correspondant dans l’effectif indiqué. Recherche globale…")
+            team_candidates = search_teams(headers, team_hint)
+            if not team_candidates:
+                st.warning("Aucune équipe trouvée pour ce libellé. On continue sans filtre équipe.")
+            elif len(team_candidates) == 1:
+                chosen_team_id = team_candidates[0]["id"]
+                st.write(f"**Équipe choisie** → {team_candidates[0]['name']} (id {chosen_team_id})")
+            else:
+                labels = [f"{t['name']} — id:{t['id']} — national:{t.get('national')}" for t in team_candidates]
+                lab = st.selectbox("Plusieurs équipes trouvées : sélectionne la bonne", labels)
+                chosen_team_id = int(lab.split("id:")[1].split(" ")[0])
+                st.write(f"**Équipe choisie** → id : `{chosen_team_id}`")
 
-        # b) recherche intelligente /players/profiles si pas trouvé
+        # a) si équipe connue → chercher le joueur dans l’effectif
+        if chosen_team_id:
+            cands = list_squad_candidates(headers, chosen_team_id, player_query)
+            if len(cands) == 1:
+                chosen_player_id = cands[0]["id"]
+            elif len(cands) > 1:
+                st.subheader("Homonymes dans l’effectif :")
+                label_map = {f"{c['name']} — {c.get('position','?')} — id:{c['id']}": c["id"] for c in cands}
+                choice = st.selectbox("Sélectionne le joueur exact", list(label_map.keys()))
+                chosen_player_id = int(label_map[choice])
+            else:
+                st.info("Joueur non trouvé dans cet effectif. Recherche globale…")
+
+        # b) recherche globale /players/profiles
         if not chosen_player_id:
             profs = profiles_search_smart(headers, player_query)
             if not profs:
-                raise RuntimeError("Aucun profil joueur trouvé. Essaie d’ajouter une équipe (champ optionnel) ou vérifie l’orthographe.")
+                raise RuntimeError("Aucun profil joueur trouvé. Corrige l’orthographe ou précise l’équipe.")
             options = []
             for p in profs[:50]:
                 pid = p.get("id")
@@ -384,45 +333,53 @@ if run_btn:
 
         st.write(f"**Joueur choisi** → id : `{chosen_player_id}`")
 
-        # 2) Saison & équipe (robuste, avec fallbacks)
-        override_season = int(season_in) if season_in.strip().isdigit() else None
-        team_id, season, how = resolve_team_and_season(headers, chosen_player_id, override_season, team_hint)
-        msgs = {
-            "season_override_players_ok": "Saison fixée par l’utilisateur, stats trouvées via /players.",
-            "season_override_team_hint_fallback": "Pas de stats via /players pour la saison saisie → fallback sur l’équipe fournie.",
-            "picked_best_player_season": "Saison la plus récente du joueur avec stats trouvées.",
-            "team_hint_with_override": "Saison saisie + équipe fournie (fallback direct).",
-            "team_hint_latest_team_season": "Aucune stat via /players → équipe fournie + saison la plus récente de l’équipe.",
-            "team_hint_default_year": "Aucune saison listée pour l’équipe → fallback sur l’année courante."
-        }
-        st.write(f"**Équipe** id `{team_id}` — **Saison cible** `{season}`")
-        st.info(msgs.get(how, how))
+        # --- 2) Déterminer l’équipe finale (si non choisie) :
+        #     - Si une équipe a été choisie via la sélection ci-dessus, on la garde.
+        #     - Sinon, on laisse l’utilisateur taper un hint ; s’il est absent, on s’arrêtera si 0 fixtures.
+        if not chosen_team_id and team_hint.strip():
+            # si l'utilisateur a tapé une équipe mais n'a pas choisi (pas de multiples), retentons
+            teams_retry = search_teams(headers, team_hint)
+            if teams_retry:
+                chosen_team_id = teams_retry[0]["id"]
+                st.write(f"**Équipe déduite** → id : `{chosen_team_id}`")
 
-        # 3) Fixtures & extraction (avec retries intelligents)
-        fixtures = get_team_fixtures(headers, team_id, season)
-        used_season = season
-        if len(fixtures) == 0:
-            st.warning("0 fixtures sur la saison ciblée. Tentative fallback : derniers matchs récents (sans paramètre saison).")
-            fixtures = get_team_fixtures_last(headers, team_id, n=50)
+        # --- 3) Chercher les fixtures (multi-stratégies)
+        fixtures: List[Dict[str, Any]] = []
+        used_note = ""
+        used_season: Optional[int] = None
 
-        if len(fixtures) == 0:
-            st.warning("Toujours 0 fixtures. On balaie les saisons de l’équipe (récentes → anciennes).")
-            team_seasons = get_team_seasons(headers, team_id)
-            for y in sorted(team_seasons, reverse=True):
-                fixtures = get_team_fixtures(headers, team_id, y)
-                if len(fixtures) > 0:
-                    used_season = y
-                    st.info(f"Fixtures trouvées sur la saison `{used_season}` (fallback).")
-                    break
+        # Si on a une saison saisie et une équipe → tenter par saison
+        if chosen_team_id and season_in.strip().isdigit():
+            y = int(season_in.strip())
+            fixtures = fixtures_by_team_season(headers, chosen_team_id, y)
+            used_season = y
+            used_note = "season_exact"
+            if len(fixtures) == 0:
+                st.warning("0 fixtures sur la saison saisie. On tente un fallback (derniers matchs).")
 
-        st.write(f"{len(fixtures)} fixtures trouvées.")
+        # Fallback 1 : derniers N matchs (sans saison)
+        if chosen_team_id and len(fixtures) == 0:
+            fixtures = fixtures_by_team_last(headers, chosen_team_id, n=50)
+            used_note = used_note or "last50"
+
+        # Fallback 2 : fenêtre glissante (ex. 36 mois)
+        if chosen_team_id and len(fixtures) == 0:
+            to_date = datetime.utcnow().date()
+            from_date = to_date - timedelta(days=months_back*30)
+            fixtures = fixtures_by_team_range(headers, chosen_team_id, from_date.isoformat(), to_date.isoformat())
+            used_note = used_note or f"range_{from_date.isoformat()}_to_{to_date.isoformat()}"
+
+        # Si on n’a toujours rien et pas d’équipe fiable => on ne peut pas continuer
         if len(fixtures) == 0:
-            st.error("Aucune fixture trouvée pour ce couple (équipe/saison) et fallbacks. Impossible de continuer l’extraction.")
+            st.error("Aucune fixture trouvée après tous les fallbacks. Vérifie que l’équipe sélectionnée est la bonne (ex: France A) ou essaye un club.")
             st.stop()
 
+        st.write(f"{len(fixtures)} fixtures trouvées. Source: {used_note or 'inconnue'}")
         prog = st.progress(0.0)
+
+        # --- 4) Extraction par fixture
         rows = []
-        top_assists_cache: Dict[Tuple[int,int], List[int]] = {}
+        top_assists_cache: Dict[Tuple[int, Optional[int]], List[int]] = {}
         total = max(1, len(fixtures))
 
         for idx, fx in enumerate(fixtures, start=1):
@@ -434,19 +391,28 @@ if run_btn:
             date_iso   = str(fixture.get("date") or "")[:10]
             league_id  = league.get("id")
             round_str  = league.get("round") or ""
+            season_fx  = league.get("season")  # utile pour topassists si dispo
 
             home = teams.get("home") if isinstance(teams.get("home"), dict) else {}
             away = teams.get("away") if isinstance(teams.get("away"), dict) else {}
             home_id, away_id = home.get("id"), away.get("id")
             home_name, away_name = home.get("name"), away.get("name")
 
-            if not (isinstance(fixture_id, int) and isinstance(home_id, int) and isinstance(away_id, int)):
+            # si aucune équipe choisie avant, on devine via présence du joueur dans lineups plus bas ; pour l’instant on saute
+            if not isinstance(fixture_id, int) or not isinstance(home_id, int) or not isinstance(away_id, int):
                 prog.progress(idx/total); continue
-
-            if team_id == home_id:
-                dom_ext = "D"; opponent_name = away_name; opponent_side = "away"
+            if not chosen_team_id:
+                # si pas d'équipe, on ne peut pas déterminer D/E -> on continue quand même, mais on marquera 'dom_ext'='?'
+                team_id = None
+                dom_ext = "?"
+                opponent_name = home_name or away_name
+                opponent_side = "home"
             else:
-                dom_ext = "E"; opponent_name = home_name; opponent_side = "home"
+                team_id = chosen_team_id
+                if team_id == home_id:
+                    dom_ext = "D"; opponent_name = away_name; opponent_side = "away"
+                else:
+                    dom_ext = "E"; opponent_name = home_name; opponent_side = "home"
 
             # stats joueur
             fps = get_fixture_players(headers, fixture_id)
@@ -462,17 +428,18 @@ if run_btn:
 
             # odds (cote adversaire 1X2)
             odds = get_fixture_odds(headers, fixture_id)
-            opp_price = extract_opponent_price(odds, opponent_side)
+            opp_price = extract_opponent_price(odds, opponent_side if chosen_team_id else "away")
 
-            # top assists présent ?
+            # top assists présent ? (si ligue + saison connus, sinon on met 0)
             key_assister_present = 0
-            if isinstance(league_id, int) and isinstance(used_season, int):
-                key = (league_id, used_season)
+            if isinstance(league_id, int):
+                key = (league_id, season_fx if isinstance(season_fx, int) else used_season)
                 if key not in top_assists_cache:
-                    top_assists_cache[key] = get_top_assisters_ids(headers, league_id, used_season)
-                key_assister_present = yesno(any_of_players_in_lineups(lineups, top_assists_cache[key]))
+                    top_assists_cache[key] = get_top_assisters_ids(headers, league_id, key[1])
+                if top_assists_cache[key]:
+                    key_assister_present = yesno(any_of_players_in_lineups(lineups, top_assists_cache[key]))
 
-            # importance binaire
+            # importance KO ?
             important = yesno(is_important_round(round_str))
 
             rows.append({
@@ -487,28 +454,26 @@ if run_btn:
                 "important": important,
                 "fixture_id": fixture_id,
                 "league_id": league_id,
-                "team_id": team_id,
                 "round": round_str,
-                "saison_utilisee": used_season,
             })
 
-            time.sleep(0.12)
+            time.sleep(0.1)
             prog.progress(min(1.0, idx/total))
 
         df = pd.DataFrame(rows)
-
         st.subheader("Résultats")
+
         if df.empty:
             st.warning("Aucune ligne à afficher (DF vide).")
             st.stop()
 
-        # Tri seulement si les colonnes sont présentes
+        # Tri si colonnes présentes
         sort_cols = [c for c in ["date", "fixture_id"] if c in df.columns]
         if sort_cols:
             df = df.sort_values(sort_cols)
 
         st.dataframe(df, use_container_width=True)
-        export_csv(df, filename=f"player_{chosen_player_id}_{used_season}.csv")
+        export_csv(df, filename=f"player_{chosen_player_id}.csv")
 
     except Exception as e:
         st.error(f"Erreur : {e}")
