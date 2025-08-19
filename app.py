@@ -1,7 +1,7 @@
 import time
 import unicodedata
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Set
 
 import pandas as pd
 import requests
@@ -28,6 +28,9 @@ def http_get(path: str, headers: Dict[str, str], params: Dict[str, Any] = None) 
     data = r.json()
     if not isinstance(data, dict):
         raise RuntimeError(f"Réponse inattendue sur {path}: type={type(data)}")
+    # uniformise la présence des clés
+    data.setdefault("errors", {})
+    data.setdefault("response", [])
     return data
 
 def yesno(b: bool) -> int:
@@ -40,13 +43,13 @@ def _normalize_profiles_list(resp: List[Any]) -> List[Dict[str, Any]]:
     out = []
     for x in resp:
         if isinstance(x, dict):
-            if "id" in x:
-                out.append(x); continue
-            if "player" in x and isinstance(x["player"], dict) and "id" in x["player"]:
+            if "id" in x:  # déjà au bon format
+                out.append(x)
+            elif "player" in x and isinstance(x["player"], dict) and "id" in x["player"]:
                 merged = dict(x["player"])
                 if "name" not in merged and "name" in x:
                     merged["name"] = x["name"]
-                out.append(merged); continue
+                out.append(merged)
     return out
 
 def _build_search_terms(player_query: str) -> List[str]:
@@ -59,16 +62,18 @@ def _build_search_terms(player_query: str) -> List[str]:
 
 def profiles_search_smart(headers: Dict[str, str], player_query: str) -> List[Dict[str, Any]]:
     terms = _build_search_terms(player_query)
-    seen: set = set()
+    seen: Set[int] = set()
     bag: List[Dict[str, Any]] = []
     for t in terms:
         data = http_get("players/profiles", headers, params={"search": t})
-        prof = _normalize_profiles_list(data.get("response", []) or [])
+        prof = _normalize_profiles_list(data["response"])
         for p in prof:
             pid = p.get("id")
             if isinstance(pid, int) and pid not in seen:
-                seen.add(pid); bag.append(p)
-        time.sleep(0.1)
+                seen.add(pid)
+                bag.append(p)
+        time.sleep(0.1)  # limiter RPS
+    # score par correspondance sur tokens
     qtokens = [t for t in norm(player_query).split() if t]
     scored = []
     for p in bag:
@@ -80,65 +85,120 @@ def profiles_search_smart(headers: Dict[str, str], player_query: str) -> List[Di
     return [p for _, p in scored][:50]
 
 # =========================
-# --- Équipes du joueur
+# --- Recherche équipes
 # =========================
-def get_player_teams(headers: Dict[str, str], player_id: int) -> List[Dict[str, Any]]:
-    """
-    /players/teams?player=ID  ->  liste des équipes & saisons où le joueur a joué.
-    """
-    data = http_get("players/teams", headers, params={"player": player_id})
-    teams = []
-    for r in data.get("response", []) or []:
+def search_teams(headers: Dict[str, str], q: str) -> List[Dict[str, Any]]:
+    if not q.strip():
+        return []
+    data = http_get("teams", headers, params={"search": q})
+    out = []
+    for r in data["response"]:
         if not isinstance(r, dict):
             continue
         team = r.get("team") or {}
+        country = r.get("country") or r.get("country")  # parfois string direct
         if isinstance(team, dict):
-            teams.append({
+            out.append({
                 "id": team.get("id"),
                 "name": team.get("name"),
-                "logo": team.get("logo"),
-                "national": team.get("national"),
-                "years": r.get("years") or []  # saisons/années passées ici si présentes
+                "code": team.get("code"),
+                "national": team.get("national"),  # True pour sélections
+                "country": country if isinstance(country, str) else None,
             })
     # dédupe
-    uniq, seen = [], set()
-    for t in teams:
+    seen: Set[int] = set()
+    uniq = []
+    for t in out:
         tid = t.get("id")
         if isinstance(tid, int) and tid not in seen:
             seen.add(tid); uniq.append(t)
     return uniq
 
 # =========================
-# --- Fixtures (multi stratégies)
+# --- Fallback: équipes du joueur sans /players/teams
 # =========================
-def fixtures_by_team_season(headers: Dict[str, str], team_id: int, season: int) -> List[Dict[str, Any]]:
-    data = http_get("fixtures", headers, params={"team": team_id, "season": season})
-    return [fx for fx in (data.get("response", []) or []) if isinstance(fx, dict)]
+def get_player_seasons(headers: Dict[str, str], player_id: int) -> List[int]:
+    data = http_get("players/seasons", headers, params={"player": player_id})
+    seasons = data.get("response", []) or []
+    return [int(s) for s in seasons if isinstance(s, int)]
 
+def teams_from_players_stats(headers: Dict[str, str], player_id: int, seasons: List[int], limit: int = 5) -> List[Dict[str, Any]]:
+    teams: List[Dict[str, Any]] = []
+    seen: Set[int] = set()
+    for y in sorted(seasons, reverse=True)[:max(1, limit)]:
+        data = http_get("players", headers, params={"id": player_id, "season": y})
+        for rec in data["response"]:
+            for st in rec.get("statistics", []) or []:
+                team = st.get("team") or {}
+                tid, tname = team.get("id"), team.get("name")
+                if isinstance(tid, int) and tid not in seen:
+                    seen.add(tid)
+                    teams.append({"id": tid, "name": tname, "national": False})
+        time.sleep(0.1)
+    return teams
+
+def build_team_candidates(headers: Dict[str, str], player_profile: Dict[str, Any], team_hint: str) -> List[Dict[str, Any]]:
+    """
+    Construit une liste d'équipes candidates si /players/teams est vide :
+    - hint utilisateur via /teams?search=
+    - équipe nationale via nationality (sélection)
+    - clubs récents via /players?id=&season=
+    """
+    candidates: List[Dict[str, Any]] = []
+    seen: Set[int] = set()
+
+    # 1) hint utilisateur
+    for t in search_teams(headers, team_hint):
+        if isinstance(t.get("id"), int) and t["id"] not in seen:
+            seen.add(t["id"]); candidates.append(t)
+
+    # 2) équipe nationale depuis nationality
+    nat = (player_profile.get("nationality") or "").strip()
+    if nat:
+        for t in search_teams(headers, nat):
+            # on retient seulement les sélections nationales
+            if t.get("national") and isinstance(t.get("id"), int) and t["id"] not in seen:
+                seen.add(t["id"]); candidates.append(t)
+
+    # 3) clubs récents via players/seasons -> players?id&season
+    pid = player_profile.get("id")
+    if isinstance(pid, int):
+        seasons = get_player_seasons(headers, pid)
+        for t in teams_from_players_stats(headers, pid, seasons, limit=5):
+            if isinstance(t.get("id"), int) and t["id"] not in seen:
+                seen.add(t["id"]); candidates.append(t)
+
+    # Tri: sélections d'abord, puis alpha
+    candidates_sorted = sorted(candidates, key=lambda t: (0 if t.get("national") else 1, norm(t.get("name") or "")))
+    return candidates_sorted
+
+# =========================
+# --- Fixtures & extraction
+# =========================
 def fixtures_by_team_last(headers: Dict[str, str], team_id: int, n: int = 50) -> List[Dict[str, Any]]:
     data = http_get("fixtures", headers, params={"team": team_id, "last": min(max(n,1), 50)})
-    return [fx for fx in (data.get("response", []) or []) if isinstance(fx, dict)]
+    return [fx for fx in (data["response"] or []) if isinstance(fx, dict)]
 
 def fixtures_by_team_range(headers: Dict[str, str], team_id: int, date_from: str, date_to: str) -> List[Dict[str, Any]]:
     data = http_get("fixtures", headers, params={"team": team_id, "from": date_from, "to": date_to})
-    return [fx for fx in (data.get("response", []) or []) if isinstance(fx, dict)]
+    return [fx for fx in (data["response"] or []) if isinstance(fx, dict)]
 
 def get_fixture_players(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
     data = http_get("fixtures/players", headers, params={"fixture": fixture_id})
-    return [x for x in (data.get("response", []) or []) if isinstance(x, dict)]
+    return [x for x in (data["response"] or []) if isinstance(x, dict)]
 
 def get_fixture_events(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
     data = http_get("fixtures/events", headers, params={"fixture": fixture_id})
-    return [e for e in (data.get("response", []) or []) if isinstance(e, dict)]
+    return [e for e in (data["response"] or []) if isinstance(e, dict)]
 
 def get_fixture_lineups(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
     data = http_get("fixtures/lineups", headers, params={"fixture": fixture_id})
-    return [x for x in (data.get("response", []) or []) if isinstance(x, dict)]
+    return [x for x in (data["response"] or []) if isinstance(x, dict)]
 
 def get_fixture_odds(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
     try:
         data = http_get("odds", headers, params={"fixture": fixture_id})
-        return [x for x in (data.get("response", []) or []) if isinstance(x, dict)]
+        return [x for x in (data["response"] or []) if isinstance(x, dict)]
     except Exception:
         return []
 
@@ -209,7 +269,7 @@ def get_top_assisters_ids(headers: Dict[str, str], league_id: Optional[int], sea
     try:
         data = http_get("players/topassists", headers, params={"league": league_id, "season": season})
         ids: List[int] = []
-        for r in (data.get("response", []) or []):
+        for r in (data["response"] or []):
             pid = (r.get("player") or {}).get("id")
             if isinstance(pid, int):
                 ids.append(pid)
@@ -235,9 +295,8 @@ with st.sidebar:
     api_key = st.text_input("API Key", value=secret_key or "", type="password",
                             help="Astuce : ajoute API_KEY dans Settings > Secrets sur Streamlit Cloud.")
     player_query = st.text_input("🔎 Joueur (ex: Kylian Mbappé)", value="")
-    # on laisse la sélection d'équipe se faire via /players/teams (plus fiable)
-    season_optional = st.text_input("Saison (YYYY, optionnel — utilisé si on choisit un club)", value="")
-    months_back = st.slider("Fallback fenêtre (mois)", 6, 60, 36)
+    team_hint = st.text_input("Rechercher une équipe (optionnel)", value="", help="A pour la sélection, U21/U23/Féminines possibles.")
+    months_back = st.slider("Fenêtre glissante si nécessaire (mois)", 6, 60, 36)
     run_btn = st.button("▶️ Rechercher & extraire")
 
 def export_csv(df: pd.DataFrame, filename: str):
@@ -261,66 +320,81 @@ if run_btn:
         except Exception:
             st.info("Info: /status indisponible (non bloquant).")
 
-        # --- 1) Trouver le joueur
+        # --- 1) Trouver le joueur (et garder nationality pour fallback)
         profs = profiles_search_smart(headers, player_query)
         if not profs:
             raise RuntimeError("Aucun profil joueur trouvé. Vérifie l’orthographe.")
         options = []
+        profile_map = {}
         for p in profs[:50]:
             pid = p.get("id")
             nm = p.get("name") or f"{p.get('firstname','')} {p.get('lastname','')}".strip()
             nat = p.get("nationality") or "?"
             by  = (p.get("birth") or {}).get("date") if isinstance(p.get("birth"), dict) else "?"
-            options.append((f"{nm} — {nat} — id:{pid}", pid))
+            label = f"{nm} — {nat} — id:{pid}"
+            options.append((label, pid))
+            profile_map[pid] = p
+
         label = st.selectbox("Sélectionne le joueur", [o[0] for o in options])
         player_id = int(dict(options)[label])
+        player_profile = profile_map[player_id]
         st.write(f"**Joueur choisi** → id : `{player_id}`")
 
-        # --- 2) Lister les équipes du joueur via /players/teams
-        teams = get_player_teams(headers, player_id)
-        if not teams:
-            raise RuntimeError("Impossible de récupérer les équipes du joueur via /players/teams.")
+        # --- 2) Essayer /players/teams avec player=ID
+        team_candidates: List[Dict[str, Any]] = []
+        try:
+            pteams = http_get("players/teams", headers, params={"player": player_id})
+            # diagnostic en cas d'erreur
+            if pteams.get("errors") and pteams["errors"] != {}:
+                st.info(f"/players/teams a renvoyé des erreurs: {pteams['errors']}")
+            for r in pteams.get("response", []) or []:
+                team = r.get("team") or {}
+                if isinstance(team, dict) and isinstance(team.get("id"), int):
+                    team_candidates.append({
+                        "id": team.get("id"),
+                        "name": team.get("name"),
+                        "national": team.get("national"),
+                    })
+        except Exception as e:
+            st.info(f"/players/teams indisponible ({e}). Fallback activé.")
 
-        # prioriser les sélections (national=True) en tête de liste
-        teams_sorted = sorted(teams, key=lambda t: (0 if t.get("national") else 1, norm(t.get("name") or "")))
-        team_labels = [f"{t['name']} — id:{t['id']} — {'Sélection' if t.get('national') else 'Club'}" for t in teams_sorted]
-        team_choice = st.selectbox("Choisis l’équipe (ex: France)", team_labels)
-        team_id = int(team_choice.split("id:")[1].split(" ")[0])
-        is_national = ("Sélection" in team_choice)
+        # --- 3) Fallback si vide : nationalité + clubs récents + hint
+        if not team_candidates:
+            st.warning("Impossible de récupérer les équipes via /players/teams → on active le fallback (nationalité, clubs récents, recherche).")
+            team_candidates = build_team_candidates(headers, player_profile, team_hint)
+
+        if not team_candidates:
+            raise RuntimeError("Aucune équipe candidate trouvée (même en fallback). Ajoute un indice dans 'Rechercher une équipe'.")
+
+        # Tri: sélections en premier
+        team_candidates = sorted(team_candidates, key=lambda t: (0 if t.get("national") else 1, norm(t.get("name") or "")))
+
+        labels = [f"{t['name']} — id:{t['id']} — {'Sélection' if t.get('national') else 'Club'}" for t in team_candidates]
+        choice = st.selectbox("Choisis l’équipe (ex: France)", labels)
+        team_id = int(choice.split("id:")[1].split(" ")[0])
+        is_national = ("Sélection" in choice)
         st.write(f"**Équipe choisie** → id : `{team_id}` — {'Sélection' if is_national else 'Club'}")
 
-        # --- 3) Récupérer des fixtures (stratégies adaptées)
+        # --- 4) Fixtures : derniers matchs puis fenêtre glissante
         fixtures: List[Dict[str, Any]] = []
         used_note = ""
 
-        # a) Si club ET saison saisie → tenter la saison
-        if (not is_national) and season_optional.strip().isdigit():
-            y = int(season_optional.strip())
-            fixtures = fixtures_by_team_season(headers, team_id, y)
-            used_note = f"season_{y}"
-            if len(fixtures) == 0:
-                st.warning("0 fixtures pour la saison saisie → fallback derniers matchs.")
-
-        # b) Derniers matchs (rapide, sans param saison)
-        if len(fixtures) == 0:
-            fixtures = fixtures_by_team_last(headers, team_id, n=50)
-            used_note = used_note or "last50"
-
-        # c) Fenêtre glissante (ex. 36 mois, réglable)
+        fixtures = fixtures_by_team_last(headers, team_id, n=50)
+        used_note = "last50"
         if len(fixtures) == 0:
             to_date = datetime.utcnow().date()
             from_date = to_date - timedelta(days=months_back*30)
             fixtures = fixtures_by_team_range(headers, team_id, from_date.isoformat(), to_date.isoformat())
-            used_note = used_note or f"range_{from_date.isoformat()}_to_{to_date.isoformat()}"
+            used_note = f"range_{from_date.isoformat()}_to_{to_date.isoformat()}"
 
         if len(fixtures) == 0:
-            st.error("Aucune fixture trouvée après tous les fallbacks (même en fenêtre de dates). Essaie un club ou augmente la fenêtre.")
+            st.error("Aucune fixture trouvée après les fallbacks. Essaie d’augmenter la fenêtre (mois) ou sélectionne un club.")
             st.stop()
 
         st.write(f"{len(fixtures)} fixtures trouvées. Source: {used_note}")
         prog = st.progress(0.0)
 
-        # --- 4) Extraction par match
+        # --- 5) Extraction par match
         rows = []
         top_assists_cache: Dict[Tuple[int, Optional[int]], List[int]] = {}
         total = max(1, len(fixtures))
@@ -351,23 +425,18 @@ if run_btn:
             else:
                 dom_ext = "?"; opponent_name = home_name or away_name; opponent_side = "away"
 
-            # stats du joueur sur ce match
             fps = get_fixture_players(headers, fixture_id)
             minutes, goals = extract_player_minutes_goals(fps, player_id)
             scored = goals > 0
 
-            # a-t-il tiré un penalty ?
             evs = get_fixture_events(headers, fixture_id)
             took_pen = player_took_penalty(evs, player_id)
 
-            # lineups (pour vérifier présence “passeur principal”)
             lineups = get_fixture_lineups(headers, fixture_id)
 
-            # cote 1X2 côté adversaire
             odds = get_fixture_odds(headers, fixture_id)
             opp_price = extract_opponent_price(odds, opponent_side)
 
-            # “passeur principal” présent ? (top assists ligue + saison si dispo)
             key_assister_present = 0
             if isinstance(league_id, int) and isinstance(season_fx, int):
                 key = (league_id, season_fx)
@@ -393,19 +462,17 @@ if run_btn:
                 "round": round_str,
             })
 
-            time.sleep(0.1)
+            time.sleep(0.08)
             prog.progress(min(1.0, idx/total))
 
         df = pd.DataFrame(rows)
         st.subheader("Résultats")
-
         if df.empty:
             st.warning("Aucune ligne à afficher (DF vide).")
             st.stop()
 
-        sort_cols = [c for c in ["date", "fixture_id"] if c in df.columns]
-        if sort_cols:
-            df = df.sort_values(sort_cols)
+        if "date" in df.columns:
+            df = df.sort_values(["date", "fixture_id"] if "fixture_id" in df.columns else ["date"])
 
         st.dataframe(df, use_container_width=True)
         export_csv(df, filename=f"player_{player_id}.csv")
