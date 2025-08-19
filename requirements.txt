@@ -1,0 +1,6 @@
+streamlit
+requests
+pandas
+aiohttp
+understat
+python-dateutil
