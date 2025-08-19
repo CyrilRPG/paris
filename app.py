@@ -162,13 +162,9 @@ def resolve_team_and_season(headers: Dict[str, str],
                             team_hint: str) -> Tuple[int, int, str]:
     """
     Renvoie (team_id, season, note_fallback).
-    Stratégie :
-      1) Si saison saisie : /players?id&season ; si rien, bascule équipe si fournie ; sinon continue.
-      2) Balaye /players/seasons du joueur (desc) et teste /players?id&season.
-      3) Si toujours rien ET team_hint fourni :
-            - team_id depuis team_hint
-            - season = override_saison si fournie, sinon max(teams/seasons) ou année courante
-      4) Sinon -> erreur claire.
+    1) saison saisie → /players?id&season ; sinon
+    2) saisons du joueur (desc) → /players?id&season ;
+    3) sinon si team_hint : team_hint + (saison saisie ou max(team/seasons) ou année courante).
     """
     # 1) Saison fixée par l'utilisateur
     if override_season:
@@ -201,7 +197,6 @@ def resolve_team_and_season(headers: Dict[str, str],
             from datetime import datetime
             return tid, datetime.utcnow().year, "team_hint_default_year"
 
-    # 4) Échec explicite
     raise RuntimeError("Impossible de déterminer équipe/saison : aucune stat via /players et pas d’équipe fiable en fallback.")
 
 # =========================
@@ -209,6 +204,10 @@ def resolve_team_and_season(headers: Dict[str, str],
 # =========================
 def get_team_fixtures(headers: Dict[str, str], team_id: int, season: int) -> List[Dict[str, Any]]:
     data = http_get("fixtures", headers, params={"team": team_id, "season": season})
+    return [fx for fx in (data.get("response", []) or []) if isinstance(fx, dict)]
+
+def get_team_fixtures_last(headers: Dict[str, str], team_id: int, n: int = 50) -> List[Dict[str, Any]]:
+    data = http_get("fixtures", headers, params={"team": team_id, "last": min(max(n,1), 50)})
     return [fx for fx in (data.get("response", []) or []) if isinstance(fx, dict)]
 
 def get_fixture_players(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
@@ -396,14 +395,32 @@ if run_btn:
             "team_hint_latest_team_season": "Aucune stat via /players → équipe fournie + saison la plus récente de l’équipe.",
             "team_hint_default_year": "Aucune saison listée pour l’équipe → fallback sur l’année courante."
         }
-        st.write(f"**Équipe** id `{team_id}` — **Saison** `{season}`")
+        st.write(f"**Équipe** id `{team_id}` — **Saison cible** `{season}`")
         st.info(msgs.get(how, how))
 
-        # 3) Fixtures & extraction
+        # 3) Fixtures & extraction (avec retries intelligents)
         fixtures = get_team_fixtures(headers, team_id, season)
-        st.write(f"{len(fixtures)} fixtures trouvées.")
-        prog = st.progress(0.0)
+        used_season = season
+        if len(fixtures) == 0:
+            st.warning("0 fixtures sur la saison ciblée. Tentative fallback : derniers matchs récents (sans paramètre saison).")
+            fixtures = get_team_fixtures_last(headers, team_id, n=50)
 
+        if len(fixtures) == 0:
+            st.warning("Toujours 0 fixtures. On balaie les saisons de l’équipe (récentes → anciennes).")
+            team_seasons = get_team_seasons(headers, team_id)
+            for y in sorted(team_seasons, reverse=True):
+                fixtures = get_team_fixtures(headers, team_id, y)
+                if len(fixtures) > 0:
+                    used_season = y
+                    st.info(f"Fixtures trouvées sur la saison `{used_season}` (fallback).")
+                    break
+
+        st.write(f"{len(fixtures)} fixtures trouvées.")
+        if len(fixtures) == 0:
+            st.error("Aucune fixture trouvée pour ce couple (équipe/saison) et fallbacks. Impossible de continuer l’extraction.")
+            st.stop()
+
+        prog = st.progress(0.0)
         rows = []
         top_assists_cache: Dict[Tuple[int,int], List[int]] = {}
         total = max(1, len(fixtures))
@@ -449,10 +466,10 @@ if run_btn:
 
             # top assists présent ?
             key_assister_present = 0
-            if isinstance(league_id, int):
-                key = (league_id, season)
+            if isinstance(league_id, int) and isinstance(used_season, int):
+                key = (league_id, used_season)
                 if key not in top_assists_cache:
-                    top_assists_cache[key] = get_top_assisters_ids(headers, league_id, season)
+                    top_assists_cache[key] = get_top_assisters_ids(headers, league_id, used_season)
                 key_assister_present = yesno(any_of_players_in_lineups(lineups, top_assists_cache[key]))
 
             # importance binaire
@@ -472,15 +489,26 @@ if run_btn:
                 "league_id": league_id,
                 "team_id": team_id,
                 "round": round_str,
+                "saison_utilisee": used_season,
             })
 
             time.sleep(0.12)
             prog.progress(min(1.0, idx/total))
 
-        df = pd.DataFrame(rows).sort_values(["date", "fixture_id"])
+        df = pd.DataFrame(rows)
+
         st.subheader("Résultats")
+        if df.empty:
+            st.warning("Aucune ligne à afficher (DF vide).")
+            st.stop()
+
+        # Tri seulement si les colonnes sont présentes
+        sort_cols = [c for c in ["date", "fixture_id"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(sort_cols)
+
         st.dataframe(df, use_container_width=True)
-        export_csv(df, filename=f"player_{chosen_player_id}_{season}.csv")
+        export_csv(df, filename=f"player_{chosen_player_id}_{used_season}.csv")
 
     except Exception as e:
         st.error(f"Erreur : {e}")
