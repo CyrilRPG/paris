@@ -1,4 +1,3 @@
-import os
 import time
 import unicodedata
 from typing import Dict, Any, List, Optional, Tuple
@@ -8,7 +7,7 @@ import requests
 import streamlit as st
 
 # =========================
-# --- Config / constantes
+# --- Config
 # =========================
 BASE_URL = "https://v3.football.api-sports.io"
 TIMEOUT = 25
@@ -40,8 +39,7 @@ def search_team_id(headers: Dict[str, str], team_query: str) -> Optional[int]:
     if not team_query.strip():
         return None
     data = http_get("teams", headers, params={"search": team_query})
-    resp = data.get("response", [])
-    for r in resp:
+    for r in data.get("response", []) or []:
         if isinstance(r, dict):
             tid = (r.get("team") or {}).get("id")
             if isinstance(tid, int):
@@ -51,12 +49,11 @@ def search_team_id(headers: Dict[str, str], team_query: str) -> Optional[int]:
 def list_squad_candidates(headers: Dict[str, str], team_id: int, player_query: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     data = http_get("players/squads", headers, params={"team": team_id})
-    resp = data.get("response", [])
     q_tokens = [t for t in norm(player_query).split() if t]
-    for blk in resp:
+    for blk in data.get("response", []) or []:
         if not isinstance(blk, dict):
             continue
-        for p in blk.get("players", []):
+        for p in blk.get("players", []) or []:
             if not isinstance(p, dict):
                 continue
             nm = p.get("name") or ""
@@ -73,33 +70,23 @@ def list_squad_candidates(headers: Dict[str, str], team_id: int, player_query: s
     return out
 
 def _normalize_profiles_list(resp: List[Any]) -> List[Dict[str, Any]]:
-    """
-    Normalise la liste renvoyée par /players/profiles pour qu’elle soit toujours
-    une liste de dicts 'plats' avec au minimum un 'id' et des champs de nom.
-    """
     out = []
     for x in resp:
         if isinstance(x, dict):
-            # cas 1: déjà plat (id, name, firstname, lastname...)
             if "id" in x:
                 out.append(x)
                 continue
-            # cas 2: encapsulé sous 'player'
             if "player" in x and isinstance(x["player"], dict) and "id" in x["player"]:
                 merged = dict(x["player"])
-                # remonter quelques champs utiles si présents ailleurs
                 if "name" not in merged and "name" in x:
                     merged["name"] = x["name"]
                 out.append(merged)
-                continue
-        # ignorer les autres (int, str, etc.)
     return out
 
 def profiles_by_lastname(headers: Dict[str, str], player_query: str) -> List[Dict[str, Any]]:
     last = player_query.split()[-1]
     data = http_get("players/profiles", headers, params={"search": last})
-    raw = data.get("response", [])
-    prof = _normalize_profiles_list(raw)
+    prof = _normalize_profiles_list(data.get("response", []) or [])
     qtokens = [t for t in norm(player_query).split() if t]
     scored = []
     for p in prof:
@@ -111,59 +98,83 @@ def profiles_by_lastname(headers: Dict[str, str], player_query: str) -> List[Dic
     scored.sort(key=lambda x: -x[0])
     return [p for _, p in scored]
 
-def player_current_team_and_season(headers: Dict[str, str], player_id: int, override_season: Optional[int]) -> Tuple[int, int]:
-    data = http_get("players/teams", headers, params={"player": player_id})
-    resp = data.get("response", [])
-    latest_year = -1
-    team_id = None
-    season_year = None
-    for entry in resp:
-        if not isinstance(entry, dict):
+# =========================
+# --- Trouver saison & équipe via /players
+# =========================
+def get_player_seasons(headers: Dict[str, str], player_id: int) -> List[int]:
+    data = http_get("players/seasons", headers, params={"player": player_id})
+    seasons = data.get("response", []) or []
+    return [int(s) for s in seasons if isinstance(s, int)]
+
+def player_team_from_players_endpoint(headers: Dict[str, str], player_id: int, season: int) -> Tuple[int, Dict[str, Any]]:
+    """
+    Utilise /players?id=PID&season=YYYY pour déterminer l'équipe.
+    Retourne (team_id, payload brut du bloc 'statistics' choisi).
+    Choix : on prend l'entrée avec le PLUS DE MINUTES (si transfert).
+    """
+    data = http_get("players", headers, params={"id": player_id, "season": season})
+    resp = data.get("response", []) or []
+    if not resp:
+        raise RuntimeError("Aucune statistique trouvée pour ce joueur et cette saison.")
+    # agrège tous les blocs statistics[*]
+    stats_blocks = []
+    for rec in resp:
+        if not isinstance(rec, dict):
             continue
-        tid = (entry.get("team") or {}).get("id")
-        if not isinstance(tid, int):
-            continue
-        for s in entry.get("seasons", []) or []:
-            if isinstance(s, dict):
-                y = s.get("year")
-                if isinstance(y, int) and y > latest_year:
-                    latest_year = y
-                    team_id = tid
-                    season_year = y
+        for st in rec.get("statistics", []) or []:
+            if isinstance(st, dict):
+                team = st.get("team") or {}
+                tid = team.get("id")
+                if isinstance(tid, int):
+                    minutes = 0
+                    games = st.get("games") or {}
+                    minutes = int(games.get("minutes", 0) or 0) if isinstance(games, dict) else 0
+                    stats_blocks.append((minutes, tid, st))
+    if not stats_blocks:
+        raise RuntimeError("Impossible d’extraire l’équipe depuis /players.")
+    stats_blocks.sort(key=lambda t: -t[0])  # plus de minutes en premier
+    return stats_blocks[0][1], stats_blocks[0][2]
+
+def resolve_team_and_season(headers: Dict[str, str], player_id: int, override_season: Optional[int]) -> Tuple[int, int]:
+    """
+    Logique robuste :
+    - si season saisie -> /players?id=&season= pour trouver team
+    - sinon -> /players/seasons pour trouver la plus récente, puis /players?id=&season=
+    - en dernier recours -> lève une erreur claire
+    """
     if override_season:
-        season_year = int(override_season)
-    if not (isinstance(team_id, int) and isinstance(season_year, int)):
-        raise RuntimeError("Impossible d’inférer équipe/saison.")
-    return team_id, season_year
+        team_id, _ = player_team_from_players_endpoint(headers, player_id, int(override_season))
+        return team_id, int(override_season)
+    seasons = get_player_seasons(headers, player_id)
+    if not seasons:
+        raise RuntimeError("Aucune saison disponible pour ce joueur.")
+    best = max(seasons)
+    team_id, _ = player_team_from_players_endpoint(headers, player_id, best)
+    return team_id, best
 
 # =========================
 # --- Données par fixture
 # =========================
 def get_team_fixtures(headers: Dict[str, str], team_id: int, season: int) -> List[Dict[str, Any]]:
     data = http_get("fixtures", headers, params={"team": team_id, "season": season})
-    resp = data.get("response", [])
-    return [fx for fx in resp if isinstance(fx, dict)]
+    return [fx for fx in (data.get("response", []) or []) if isinstance(fx, dict)]
 
 def get_fixture_players(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
     data = http_get("fixtures/players", headers, params={"fixture": fixture_id})
-    resp = data.get("response", [])
-    return [x for x in resp if isinstance(x, dict)]
+    return [x for x in (data.get("response", []) or []) if isinstance(x, dict)]
 
 def get_fixture_events(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
     data = http_get("fixtures/events", headers, params={"fixture": fixture_id})
-    resp = data.get("response", [])
-    return [e for e in resp if isinstance(e, dict)]
+    return [e for e in (data.get("response", []) or []) if isinstance(e, dict)]
 
 def get_fixture_lineups(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
     data = http_get("fixtures/lineups", headers, params={"fixture": fixture_id})
-    resp = data.get("response", [])
-    return [x for x in resp if isinstance(x, dict)]
+    return [x for x in (data.get("response", []) or []) if isinstance(x, dict)]
 
 def get_fixture_odds(headers: Dict[str, str], fixture_id: int) -> List[Dict[str, Any]]:
     try:
         data = http_get("odds", headers, params={"fixture": fixture_id})
-        resp = data.get("response", [])
-        return [x for x in resp if isinstance(x, dict)]
+        return [x for x in (data.get("response", []) or []) if isinstance(x, dict)]
     except Exception:
         return []
 
@@ -181,8 +192,8 @@ def extract_player_minutes_goals(fixture_players_payload: List[Dict[str, Any]], 
             if pid == player_id:
                 stats_list = p.get("statistics") or []
                 stats = stats_list[0] if stats_list and isinstance(stats_list[0], dict) else {}
-                minutes = int(stats.get("games", {}).get("minutes", 0) or 0) if isinstance(stats.get("games"), dict) else 0
-                goals = int(stats.get("goals", {}).get("total", 0) or 0) if isinstance(stats.get("goals"), dict) else 0
+                minutes = int((stats.get("games") or {}).get("minutes", 0) or 0) if isinstance(stats.get("games"), dict) else 0
+                goals   = int((stats.get("goals") or {}).get("total", 0) or 0) if isinstance(stats.get("goals"), dict) else 0
                 return minutes, goals
     return minutes, goals
 
@@ -221,13 +232,11 @@ def extract_opponent_price(odds_payload: List[Dict[str, Any]], opponent_side: st
 def get_top_assisters_ids(headers: Dict[str, str], league_id: int, season: int) -> List[int]:
     try:
         data = http_get("players/topassists", headers, params={"league": league_id, "season": season})
-        resp = data.get("response", [])
         ids: List[int] = []
-        for r in resp:
+        for r in (data.get("response", []) or []):
             if not isinstance(r, dict):
                 continue
-            pl = r.get("player") or {}
-            pid = pl.get("id")
+            pid = (r.get("player") or {}).get("id")
             if isinstance(pid, int):
                 ids.append(pid)
         return ids
@@ -241,8 +250,7 @@ def any_of_players_in_lineups(lineups: List[Dict[str, Any]], player_ids: List[in
             for p in (team.get(blk) or []):
                 if not isinstance(p, dict):
                     continue
-                pdata = p.get("player") or {}
-                pid = pdata.get("id")
+                pid = (p.get("player") or {}).get("id")
                 if isinstance(pid, int):
                     present.add(pid)
     return len(set(player_ids) & present) > 0
@@ -281,7 +289,7 @@ if run_btn:
 
         headers = api_headers(provider, api_key.strip())
 
-        # 0) statut (non bloquant)
+        # (Info) statut
         try:
             status = http_get("status", headers)
             sub = status.get("response", {}).get("subscription", {})
@@ -289,7 +297,7 @@ if run_btn:
         except Exception:
             st.info("Info: /status indisponible (non bloquant).")
 
-        # 1) Trouver le joueur
+        # 1) Trouver le joueur (équipe si fournie -> effectif, sinon profils)
         chosen_player_id: Optional[int] = None
         if team_hint.strip():
             tid = search_team_id(headers, team_hint)
@@ -312,7 +320,7 @@ if run_btn:
             options = []
             for p in profs[:50]:
                 pid = p.get("id")
-                if not isinstance(pid, int):  # garde-fou
+                if not isinstance(pid, int):
                     continue
                 nm = p.get("name") or f"{p.get('firstname','')} {p.get('lastname','')}".strip()
                 nat = p.get("nationality") or "?"
@@ -325,12 +333,12 @@ if run_btn:
 
         st.write(f"**Joueur choisi** → id : `{chosen_player_id}`")
 
-        # 2) Équipe & saison
+        # 2) Saison & équipe via /players (robuste)
         override_season = int(season_in) if season_in.strip().isdigit() else None
-        team_id, season = player_current_team_and_season(headers, chosen_player_id, override_season)
+        team_id, season = resolve_team_and_season(headers, chosen_player_id, override_season)
         st.write(f"**Équipe** id `{team_id}` — **Saison** `{season}`")
 
-        # 3) Fixtures
+        # 3) Fixtures & extraction
         fixtures = get_team_fixtures(headers, team_id, season)
         st.write(f"{len(fixtures)} fixtures trouvées.")
         prog = st.progress(0.0)
