@@ -1,6 +1,6 @@
 import time
 import unicodedata
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Iterable
 
 import pandas as pd
 import requests
@@ -74,32 +74,53 @@ def _normalize_profiles_list(resp: List[Any]) -> List[Dict[str, Any]]:
     for x in resp:
         if isinstance(x, dict):
             if "id" in x:
-                out.append(x)
-                continue
+                out.append(x); continue
             if "player" in x and isinstance(x["player"], dict) and "id" in x["player"]:
                 merged = dict(x["player"])
                 if "name" not in merged and "name" in x:
                     merged["name"] = x["name"]
-                out.append(merged)
+                out.append(merged); continue
     return out
 
-def profiles_by_lastname(headers: Dict[str, str], player_query: str) -> List[Dict[str, Any]]:
-    last = player_query.split()[-1]
-    data = http_get("players/profiles", headers, params={"search": last})
-    prof = _normalize_profiles_list(data.get("response", []) or [])
+def _build_search_terms(player_query: str) -> List[str]:
+    q = norm(player_query)
+    toks = [t for t in q.split() if len(t) >= 3]
+    # si nom trop court, prendre début du string
+    if not toks and len(q) >= 3:
+        toks = [q[:3]]
+    # combinaisons utiles : chaque token + full query si >=3
+    terms = list(dict.fromkeys(toks + ([q] if len(q) >= 3 else [])))
+    return terms[:5]  # limite de sûreté
+
+def profiles_search_smart(headers: Dict[str, str], player_query: str) -> List[Dict[str, Any]]:
+    """Essaie plusieurs requêtes /players/profiles?search=TERM et fusionne/déduplique."""
+    terms = _build_search_terms(player_query)
+    seen: set = set()
+    bag: List[Dict[str, Any]] = []
+    for t in terms:
+        data = http_get("players/profiles", headers, params={"search": t})
+        prof = _normalize_profiles_list(data.get("response", []) or [])
+        for p in prof:
+            pid = p.get("id")
+            if isinstance(pid, int) and pid not in seen:
+                seen.add(pid); bag.append(p)
+        # petite pause pour le RPS
+        time.sleep(0.1)
+    # scoring par similarité grossière
     qtokens = [t for t in norm(player_query).split() if t]
     scored = []
-    for p in prof:
+    for p in bag:
         cand = p.get("name") or f"{p.get('firstname','')} {p.get('lastname','')}".strip()
         cn = norm(cand)
         score = sum(tok in cn for tok in qtokens)
-        if score > 0 and isinstance(p.get("id"), int):
-            scored.append((score, p))
-    scored.sort(key=lambda x: -x[0])
-    return [p for _, p in scored]
+        scored.append((score, p))
+    scored.sort(key=lambda x: (-x[0], norm(x[1].get("name") or "")))
+    # si aucun score >0, on renvoie quand même les meilleurs candidats trouvés
+    top = [p for _, p in scored][:50]
+    return top
 
 # =========================
-# --- Trouver saison & équipe via /players
+# --- Saison & équipe via /players
 # =========================
 def get_player_seasons(headers: Dict[str, str], player_id: int) -> List[int]:
     data = http_get("players/seasons", headers, params={"player": player_id})
@@ -107,16 +128,10 @@ def get_player_seasons(headers: Dict[str, str], player_id: int) -> List[int]:
     return [int(s) for s in seasons if isinstance(s, int)]
 
 def player_team_from_players_endpoint(headers: Dict[str, str], player_id: int, season: int) -> Tuple[int, Dict[str, Any]]:
-    """
-    Utilise /players?id=PID&season=YYYY pour déterminer l'équipe.
-    Retourne (team_id, payload brut du bloc 'statistics' choisi).
-    Choix : on prend l'entrée avec le PLUS DE MINUTES (si transfert).
-    """
     data = http_get("players", headers, params={"id": player_id, "season": season})
     resp = data.get("response", []) or []
     if not resp:
         raise RuntimeError("Aucune statistique trouvée pour ce joueur et cette saison.")
-    # agrège tous les blocs statistics[*]
     stats_blocks = []
     for rec in resp:
         if not isinstance(rec, dict):
@@ -126,22 +141,15 @@ def player_team_from_players_endpoint(headers: Dict[str, str], player_id: int, s
                 team = st.get("team") or {}
                 tid = team.get("id")
                 if isinstance(tid, int):
-                    minutes = 0
                     games = st.get("games") or {}
                     minutes = int(games.get("minutes", 0) or 0) if isinstance(games, dict) else 0
                     stats_blocks.append((minutes, tid, st))
     if not stats_blocks:
         raise RuntimeError("Impossible d’extraire l’équipe depuis /players.")
-    stats_blocks.sort(key=lambda t: -t[0])  # plus de minutes en premier
+    stats_blocks.sort(key=lambda t: -t[0])
     return stats_blocks[0][1], stats_blocks[0][2]
 
 def resolve_team_and_season(headers: Dict[str, str], player_id: int, override_season: Optional[int]) -> Tuple[int, int]:
-    """
-    Logique robuste :
-    - si season saisie -> /players?id=&season= pour trouver team
-    - sinon -> /players/seasons pour trouver la plus récente, puis /players?id=&season=
-    - en dernier recours -> lève une erreur claire
-    """
     if override_season:
         team_id, _ = player_team_from_players_endpoint(headers, player_id, int(override_season))
         return team_id, int(override_season)
@@ -202,14 +210,12 @@ def player_took_penalty(events: List[Dict[str, Any]], player_id: int) -> bool:
         etype = str(e.get("type") or "").lower()
         detail = str(e.get("detail") or "").lower()
         pid = (e.get("player") or {}).get("id")
-        if pid == player_id and (
-            (etype == "goal" and "penalty" in detail) or etype == "penalty"
-        ):
+        if pid == player_id and ((etype == "goal" and "penalty" in detail) or etype == "penalty"):
             return True
     return False
 
 def extract_opponent_price(odds_payload: List[Dict[str, Any]], opponent_side: str) -> Optional[float]:
-    opp = opponent_side.lower()  # "home"/"away"
+    opp = opponent_side.lower()
     for o in odds_payload:
         for book in (o.get("bookmakers") or []):
             if not isinstance(book, dict):
@@ -297,8 +303,10 @@ if run_btn:
         except Exception:
             st.info("Info: /status indisponible (non bloquant).")
 
-        # 1) Trouver le joueur (équipe si fournie -> effectif, sinon profils)
+        # 1) Trouver le joueur
         chosen_player_id: Optional[int] = None
+
+        # a) si équipe fournie -> effectif
         if team_hint.strip():
             tid = search_team_id(headers, team_hint)
             if tid:
@@ -306,34 +314,33 @@ if run_btn:
                 if len(cands) == 1:
                     chosen_player_id = cands[0]["id"]
                 elif len(cands) > 1:
-                    st.subheader("Plusieurs joueurs trouvés :")
+                    st.subheader("Plusieurs joueurs trouvés dans l’effectif :")
                     label_map = {f"{c['name']} — {c.get('position','?')} — id:{c['id']}": c["id"] for c in cands}
                     choice = st.selectbox("Sélectionne le joueur exact", list(label_map.keys()))
                     chosen_player_id = int(label_map[choice])
                 else:
-                    st.warning("Aucun joueur correspondant dans l’effectif indiqué. On tente une recherche globale…")
+                    st.warning("Aucun joueur correspondant dans l’effectif indiqué. Recherche globale…")
 
+        # b) recherche intelligente /players/profiles si pas trouvé
         if not chosen_player_id:
-            profs = profiles_by_lastname(headers, player_query)
+            profs = profiles_search_smart(headers, player_query)
             if not profs:
-                raise RuntimeError("Aucun profil joueur trouvé.")
+                raise RuntimeError("Aucun profil joueur trouvé. Essaie d’ajouter une équipe (champ optionnel) ou vérifie l’orthographe.")
             options = []
             for p in profs[:50]:
                 pid = p.get("id")
-                if not isinstance(pid, int):
+                if not isinstance(pid, int):  # garde-fou
                     continue
                 nm = p.get("name") or f"{p.get('firstname','')} {p.get('lastname','')}".strip()
                 nat = p.get("nationality") or "?"
                 by  = (p.get("birth") or {}).get("date") if isinstance(p.get("birth"), dict) else "?"
                 options.append((f"{nm} — {nat} — id:{pid}", pid))
-            if not options:
-                raise RuntimeError("Aucun profil exploitable (id manquant).")
             label = st.selectbox("Sélectionne le joueur", [o[0] for o in options])
             chosen_player_id = int(dict(options)[label])
 
         st.write(f"**Joueur choisi** → id : `{chosen_player_id}`")
 
-        # 2) Saison & équipe via /players (robuste)
+        # 2) Saison & équipe via /players
         override_season = int(season_in) if season_in.strip().isdigit() else None
         team_id, season = resolve_team_and_season(headers, chosen_player_id, override_season)
         st.write(f"**Équipe** id `{team_id}` — **Saison** `{season}`")
